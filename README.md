@@ -9,7 +9,7 @@ Most of the highly-egregious offenses occur at the intersection directly across 
 From Toyota Yurus' to Ford F250's, violators come in all shapes in sizes. I hope that if I gather enough evidence, I can submit a request to the LA Transportation Office to place speed bumps or any other remedy.
 
 # Roadmap
-- [ ] Use existing models to get object detection working
+- [X] Use existing models to get object detection working
 - [ ] Filter non-vehicles and identify where the intersection sits in frame
 - [ ] Program to test whether a vehicle comes to a safe stop
 - [ ] Build a waterproof enclosure for a Raspberry Pi or BeagleBone REV3 and a USB camera + a solar power source
