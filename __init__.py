@@ -1,10 +1,12 @@
 import cv2
 import numpy as np
 import supervision as sv
+import time
 
 from collections import defaultdict
+from cv2.typing import MatLike
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Callable
 from ultralytics import YOLO
 
 """
@@ -28,19 +30,61 @@ print("Loading model...")
 MODEL = YOLO(PYTORCH_MODEL_PATH)
 print("Loaded.")
 
+
 def scale_xy_down(xy: tuple[int, int]) -> tuple[int, int]:
     return (int(xy[0] * SCALE_FACTOR), int(xy[1] * SCALE_FACTOR))
+   
     
 def scale_xy_up(xy: tuple[int, int]) -> tuple[int, int]:
     return (xy[0] // SCALE_FACTOR, xy[1] // SCALE_FACTOR)
 
+
 # Numpy doesn't like sets, so we have to use a plain array
 VEHICLE_IDS = [CAR, MOTORCYCLE, BUS, TRUCK, PERSON]
 
-class VideoStream:  
+
+class TrackedObject:
+    
+    __slots__ = 'positions', 'at_intersection'
+    
+    def __init__(self) -> None:
+        self.positions = []
+        self.at_intersection = None
+        
+    def add(self, pos: tuple[float, float]):
+        self.positions.append(pos)
+
+        if len(self.positions) > 30:
+            self.positions.pop(0)
+            
+    def draw_to_frame(self, frame: MatLike):
+        points = np.hstack(self.positions).astype(np.int32).reshape((-1, 1, 2))
+        cv2.polylines(frame, [points], isClosed=False, color=(0, 0xff, 0), thickness=15)
+
+
+class TrackedObjects:
+    
+    __slots__ = 'objects'
+    
+    def __init__(self) -> None:
+        self.objects = defaultdict(lambda: TrackedObject())
+    
+    def update_tracking(self, tracking_id: int, pos: tuple[float, float]) -> TrackedObject:
+        track: TrackedObject = self.objects[tracking_id]
+        track.add(pos)
+        return track
+    
+    def __contains__(self, item: int):
+        return item in self.objects
+
+
+class VideoStream:
+    
+    __slots__ = 'source', 'track_history', 'painter'
+    
     def __init__(self, source: cv2.VideoCapture) -> None:
         self.source = source
-        self.track_history = defaultdict(lambda: [])
+        self.track_history = TrackedObjects()
         self.painter = sv.BoxAnnotator(
             thickness=WINDOW_LINE_THICKNESS,
             text_thickness=WINDOW_TEXT_THICKNESS,
@@ -49,22 +93,6 @@ class VideoStream:
         
     def __iter__(self):
         return self
-    
-    def update_tracking(self, this_frame_tracks: Tensor, detected_idx: int, pos: tuple[float, float]):
-        # copy to new variable to avoid side effects
-        track_ids_list = this_frame_tracks.cpu().int().tolist()
-        track_id = track_ids_list[detected_idx]
-                    
-                    
-        if self.track_history.get(track_id) is None:
-            self.track_history[track_id] = [pos]
-        else:
-            if len(self.track_history[track_id]) > 30:
-                self.track_history[track_id].pop(0)
-                
-            self.track_history[track_id].append(pos)                    
-
-        return self.track_history.get(track_id)
     
     def __next__(self) -> Optional[np.ndarray]:
         ok, frame = self.source.read()
@@ -104,11 +132,13 @@ class VideoStream:
                 if track_ids is not None:
                     center_of_box = (float((x2 + x1) / 2), float((y2 + y1) / 2))
 
-                    track = self.update_tracking(track_ids, idx, center_of_box)
+                    track_ids_list = track_ids.cpu().int().tolist()
+                    track_id = track_ids_list[idx]
+
+                    track: TrackedObject = self.track_history.update_tracking(track_id, center_of_box)
                     
                     # Draw the tracking lines
-                    points = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(frame, [points], isClosed=False, color=(0, 0xff, 0), thickness=15)
+                    track.draw_to_frame(frame)
 
             
                 detections.xyxy[idx] = (x1, y1, x2, y2)
@@ -125,27 +155,71 @@ class VideoStream:
         return frame
 
 
-def main():
-    capture = None
-    
-    try:
-        print("Opening camera port", CAMERA_INPUT_PORT, "...")
-        capture = cv2.VideoCapture(CAMERA_INPUT_PORT, cv2.CAP_DSHOW)
-        print("Camera opened")
+def format_cv2_input(getter: Callable[[], cv2.VideoCapture]) -> Callable[[], cv2.VideoCapture]:
+    def inner():
+        print("Getting input source...")
+        capture = getter()
+        print("Done:", capture)
+        
+        print("Waiting for device:")
+        
+        i = 0
+        while not capture.isOpened():
+            dots = (i % 3 + 1)
+            print("." * dots, " " * (3 - dots), " (", i, "s elapsed)", sep="", end="\r")
+            
+            time.sleep(1)
+
+            i += 1
+            
+        print("Ready")
     
         print("Setting dimensions...")
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, WINDOW_DIMS[0])
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, WINDOW_DIMS[1])
-        capture.set(cv2.CAP_PROP_FPS, 60)
+        capture.set(cv2.CAP_PROP_FPS, 30)
         print("Done")
+        return capture
+        
+    return inner
 
+
+@format_cv2_input
+def live_capture() -> cv2.VideoCapture:  
+    return cv2.VideoCapture(CAMERA_INPUT_PORT, cv2.CAP_DSHOW)
+
+
+@format_cv2_input
+def video_capture() -> cv2.VideoCapture:
+    return cv2.VideoCapture("./data/camera_data_from_yt_0.avi")
+
+
+def main():
+    capture = None
     
+    try:
+        capture = live_capture()
+        
         stream = VideoStream(capture)
 
+        # used to record the time when we processed last frame 
+        prev_frame_time = 0
+  
+        # used to record the time at which we processed current frame 
+        new_frame_time = 0
+
         for frame in stream:
+            # time when we finish processing for this frame 
+            new_frame_time = time.time() 
+  
+            fps = 1/(new_frame_time-prev_frame_time) 
+            prev_frame_time = new_frame_time 
+
             if frame is None:
                 # cv2 camera IN stream is lagging behind: skip this render
                 continue
+
+            cv2.putText(frame, f"{fps:.2f} fps", (7, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (100, 255, 0), 3, cv2.LINE_AA) 
 
             cv2.imshow("YOLOv8", frame)
 
@@ -156,6 +230,7 @@ def main():
         if capture is not None:
             capture.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
